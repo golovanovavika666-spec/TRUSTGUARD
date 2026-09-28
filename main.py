@@ -14,12 +14,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY не найден в .env")
+    raise RuntimeError("GEMINI_API_KEY не задан в переменных окружения")
 
 if not TAVILY_API_KEY:
-    raise RuntimeError("TAVILY_API_KEY не найден в .env")
-
-
+    raise RuntimeError("TAVILY_API_KEY не задан в переменных окружения")
 gemini = genai.Client(api_key=GEMINI_API_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
