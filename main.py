@@ -237,3 +237,28 @@ def analyze(request: AnalyzeRequest):
 
         "sources": sources
     }
+
+class PhoneCheckRequest(BaseModel):
+    phone_number: str
+
+
+@app.post("/check-phone")
+def check_phone(request: PhoneCheckRequest):
+    phone = request.phone_number.strip()
+
+    if not phone or len(phone) > 32:
+        raise HTTPException(
+            status_code=400,
+            detail="Некорректный номер телефона"
+        )
+
+    # Пока у нас нет базы подтверждённых мошеннических номеров.
+    # Поэтому не называем номер безопасным или мошенническим
+    # без доказательств.
+    return {
+        "status": "success",
+        "phone_number": phone,
+        "risk_level": "UNKNOWN",
+        "is_suspicious": False,
+        "explanation": "Данных для оценки номера пока недостаточно"
+    }
