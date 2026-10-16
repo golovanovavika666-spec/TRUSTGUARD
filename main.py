@@ -242,23 +242,54 @@ class PhoneCheckRequest(BaseModel):
     phone_number: str
 
 
+
 @app.post("/check-phone")
 def check_phone(request: PhoneCheckRequest):
-    phone = request.phone_number.strip()
+    import re
 
-    if not phone or len(phone) > 32:
+    phone = request.phone_number.strip()
+    digits = re.sub(r"\D", "", phone)
+
+    if not 7 <= len(digits) <= 15:
         raise HTTPException(
             status_code=400,
             detail="Некорректный номер телефона"
         )
 
-    # Пока у нас нет базы подтверждённых мошеннических номеров.
-    # Поэтому не называем номер безопасным или мошенническим
-    # без доказательств.
-    return {
-        "status": "success",
-        "phone_number": phone,
-        "risk_level": "UNKNOWN",
-        "is_suspicious": False,
-        "explanation": "Данных для оценки номера пока недостаточно"
-    }
+    # Ищем публичные жалобы на этот номер.
+    try:
+        result = tavily.search(
+            query=f'"{phone}" мошенники спам жалобы',
+            max_results=5,
+            search_depth="basic"
+        )
+
+        sources = []
+
+        for item in result.get("results", []):
+            sources.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", "")
+            })
+
+        return {
+            "status": "success",
+            "phone_number": phone,
+            "risk_level": "UNKNOWN",
+            "is_suspicious": False,
+            "explanation": (
+                "Поиск публичных сведений выполнен. "
+                "Наличие результатов не доказывает мошенничество."
+            ),
+            "sources": sources
+        }
+
+    except Exception:
+        return {
+            "status": "success",
+            "phone_number": phone,
+            "risk_level": "UNKNOWN",
+            "is_suspicious": False,
+            "explanation": "Не удалось выполнить поиск сведений о номере",
+            "sources": []
+        }
