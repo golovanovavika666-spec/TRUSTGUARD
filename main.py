@@ -243,6 +243,7 @@ class PhoneCheckRequest(BaseModel):
 
 
 
+
 @app.post("/check-phone")
 def check_phone(request: PhoneCheckRequest):
     import re
@@ -256,40 +257,110 @@ def check_phone(request: PhoneCheckRequest):
             detail="Некорректный номер телефона"
         )
 
-    # Ищем публичные жалобы на этот номер.
+    # Несколько вариантов записи одного номера.
+    variants = {phone, digits, f"+{digits}"}
+
+    # Для номеров Казахстана и России учитываем 8 вместо 7.
+    if len(digits) == 11 and digits.startswith("7"):
+        variants.add("8" + digits[1:])
+
     try:
         result = tavily.search(
-            query=f'"{phone}" мошенники спам жалобы',
-            max_results=5,
+            query=f'"{digits}"',
+            max_results=10,
             search_depth="basic"
         )
 
         sources = []
+        complaint_count = 0
+
+        complaint_words = (
+            "мошенник",
+            "мошенники",
+            "мошенничество",
+            "спам",
+            "обман",
+            "развод",
+            "вымогательство",
+            "fraud",
+            "scam"
+        )
 
         for item in result.get("results", []):
+            title = item.get("title", "")
+            content = item.get("content", "")
+            url = item.get("url", "")
+
+            text = f"{title} {content}".lower()
+
+            # Проверяем, упоминается ли конкретный номер.
+            normalized_text = re.sub(r"\D", "", text)
+
+            number_found = any(
+                variant in text
+                for variant in variants
+                if variant
+            ) or digits in normalized_text
+
+            if not number_found:
+                continue
+
+            # Проверяем наличие слов, связанных с жалобами.
+            has_complaint = any(
+                word in text
+                for word in complaint_words
+            )
+
             sources.append({
-                "title": item.get("title", ""),
-                "url": item.get("url", "")
+                "title": title,
+                "url": url,
+                "has_complaint": has_complaint
             })
+
+            if has_complaint:
+                complaint_count += 1
+
+        # Предварительная оценка по количеству найденных
+        # упоминаний. Это не подтверждение мошенничества.
+        if complaint_count >= 3:
+            risk_level = "HIGH"
+            explanation = (
+                "Найдено несколько публичных упоминаний "
+                "номера в материалах с признаками жалоб. "
+                "Рекомендуется соблюдать осторожность."
+            )
+        elif complaint_count >= 1:
+            risk_level = "MEDIUM"
+            explanation = (
+                "Найдено упоминание номера рядом со словами, "
+                "связанными с мошенничеством или спамом. "
+                "Достоверность жалобы не подтверждена."
+            )
+        else:
+            risk_level = "UNKNOWN"
+            explanation = (
+                "Достоверных сведений о мошенничестве "
+                "по этому номеру не найдено. "
+                "Это не означает, что номер безопасен."
+            )
 
         return {
             "status": "success",
             "phone_number": phone,
-            "risk_level": "UNKNOWN",
-            "is_suspicious": False,
-            "explanation": (
-                "Поиск публичных сведений выполнен. "
-                "Наличие результатов не доказывает мошенничество."
-            ),
+            "risk_level": risk_level,
+            "is_suspicious": complaint_count > 0,
+            "explanation": explanation,
+            "complaint_count": complaint_count,
             "sources": sources
         }
 
     except Exception:
         return {
-            "status": "success",
+            "status": "error",
             "phone_number": phone,
             "risk_level": "UNKNOWN",
             "is_suspicious": False,
             "explanation": "Не удалось выполнить поиск сведений о номере",
+            "complaint_count": 0,
             "sources": []
         }
