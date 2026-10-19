@@ -241,7 +241,6 @@ def analyze(request: AnalyzeRequest):
 class PhoneCheckRequest(BaseModel):
     phone_number: str
 
-
 @app.post("/check-phone")
 def check_phone(request: PhoneCheckRequest):
     import re
@@ -255,40 +254,48 @@ def check_phone(request: PhoneCheckRequest):
             detail="Некорректный номер телефона"
         )
 
-    # Подготавливаем возможные варианты записи номера.
-    phone_variants = {digits}
+    variants = {digits}
 
     if len(digits) == 11 and digits.startswith("8"):
-        phone_variants.add("7" + digits[1:])
+        variants.add("7" + digits[1:])
 
     if len(digits) == 11 and digits.startswith("7"):
-        phone_variants.add("8" + digits[1:])
+        variants.add("8" + digits[1:])
 
-    # Ищем каждый вариант отдельно, чтобы повысить шанс найти жалобы.
-    complaint_words = (
-        "мошенник",
-        "мошенники",
-        "мошенничество",
-        "мошеннический",
-        "спам",
-        "обман",
-        "развод",
-        "вымогательство",
-        "fraud",
-        "scam",
-        "spam",
-        "жалоба",
-        "звонят",
-        "навязывают"
+    # Слова должны указывать именно на жалобу на звонок.
+    complaint_phrases = (
+        "мошеннический звонок",
+        "звонят мошенники",
+        "номер мошенников",
+        "номер мошенника",
+        "этот номер мошенник",
+        "телефонные мошенники",
+        "подозрительный звонок",
+        "жалоба на номер",
+        "жалобы на номер",
+        "спам звонки",
+        "нежелательные звонки",
+        "scam call",
+        "fraud call",
+        "reported as spam",
+        "phone scam",
+        "scammer number"
+    )
+
+    # Технические страницы не считаем доказательством жалобы.
+    excluded_domains = (
+        "docs.ps.kz",
+        "autocall.kz"
     )
 
     sources_by_url = {}
 
     try:
-        for variant in phone_variants:
+        for variant in variants:
             queries = [
-                f'"{variant}" мошенники OR мошенничество OR спам',
-                f'"{variant}" отзывы OR жалобы OR кто звонил'
+                f'"{variant}" "звонят мошенники"',
+                f'"{variant}" "жалоба на номер"',
+                f'"{variant}" "scam call" OR "fraud call"'
             ]
 
             for query in queries:
@@ -310,67 +317,64 @@ def check_phone(request: PhoneCheckRequest):
                     content = item.get("content", "")
                     url = item.get("url", "")
 
-                    combined_text = f"{title} {content}"
-                    normalized_text = re.sub(
-                        r"\D", "", combined_text
+                    # Проверяем, что номер присутствует в тексте.
+                    normalized = re.sub(
+                        r"\D", "", f"{title} {content}"
                     )
 
-                    # Сохраняем только результаты, где найден номер.
-                    if not any(
-                        candidate in normalized_text
-                        for candidate in phone_variants
+                    if not any(v in normalized for v in variants):
+                        continue
+
+                    domain = url.lower().split("/")[2] if "://" in url else ""
+
+                    if any(
+                        domain == excluded or domain.endswith("." + excluded)
+                        for excluded in excluded_domains
                     ):
                         continue
 
-                    text_lower = combined_text.lower()
+                    text_lower = f"{title} {content}".lower()
 
                     has_complaint = any(
-                        word in text_lower
-                        for word in complaint_words
+                        phrase in text_lower
+                        for phrase in complaint_phrases
                     )
 
-                    source_key = url or f"{title}:{content[:100]}"
+                    key = url or f"{title}:{content[:100]}"
 
-                    existing = sources_by_url.get(source_key)
-
-                    if existing:
-                        existing["has_complaint"] = (
-                            existing["has_complaint"] or has_complaint
-                        )
-                    else:
-                        sources_by_url[source_key] = {
+                    if key not in sources_by_url:
+                        sources_by_url[key] = {
                             "title": title,
                             "url": url,
                             "has_complaint": has_complaint
                         }
+                    elif has_complaint:
+                        sources_by_url[key]["has_complaint"] = True
 
         sources = list(sources_by_url.values())
 
-        # Считаем уникальные найденные страницы, а не количество запросов.
-        complaint_sources = [
-            source for source in sources
-            if source["has_complaint"]
-        ]
+        complaint_count = sum(
+            1 for source in sources if source["has_complaint"]
+        )
 
-        complaint_count = len(complaint_sources)
-
+        # Не блокируем номер только по результатам общего поиска.
+        # Для HIGH нужны несколько отдельных страниц с явными жалобами.
         if complaint_count >= 3:
             risk_level = "HIGH"
             explanation = (
-                "На нескольких найденных страницах есть признаки "
-                "жалоб на номер. Это сигнал риска, но не окончательное "
-                "доказательство мошенничества."
+                "Найдено несколько страниц с формулировками, "
+                "похожими на жалобы на номер. Требуется проверка источников."
             )
         elif complaint_count >= 1:
             risk_level = "MEDIUM"
             explanation = (
-                "Найдена страница с возможными признаками жалоб "
-                "на номер. Требуется дополнительная проверка."
+                "Найдены возможные жалобы на номер. "
+                "Информация не подтверждена окончательно."
             )
         else:
             risk_level = "UNKNOWN"
             explanation = (
-                "Не удалось найти достаточно подтверждающих данных. "
+                "Не найдено достаточно явных жалоб на номер. "
                 "Это не означает, что номер безопасен."
             )
 
