@@ -242,7 +242,6 @@ class PhoneCheckRequest(BaseModel):
     phone_number: str
 
 
-
 @app.post("/check-phone")
 def check_phone(request: PhoneCheckRequest):
     import re
@@ -256,69 +255,122 @@ def check_phone(request: PhoneCheckRequest):
             detail="Некорректный номер телефона"
         )
 
+    # Подготавливаем возможные варианты записи номера.
+    phone_variants = {digits}
+
+    if len(digits) == 11 and digits.startswith("8"):
+        phone_variants.add("7" + digits[1:])
+
+    if len(digits) == 11 and digits.startswith("7"):
+        phone_variants.add("8" + digits[1:])
+
+    # Ищем каждый вариант отдельно, чтобы повысить шанс найти жалобы.
+    complaint_words = (
+        "мошенник",
+        "мошенники",
+        "мошенничество",
+        "мошеннический",
+        "спам",
+        "обман",
+        "развод",
+        "вымогательство",
+        "fraud",
+        "scam",
+        "spam",
+        "жалоба",
+        "звонят",
+        "навязывают"
+    )
+
+    sources_by_url = {}
+
     try:
-        result = tavily.search(
-            query=f'"{digits}" мошенничество OR спам OR мошенник',
-            max_results=10,
-            search_depth="advanced"
-        )
+        for variant in phone_variants:
+            queries = [
+                f'"{variant}" мошенники OR мошенничество OR спам',
+                f'"{variant}" отзывы OR жалобы OR кто звонил'
+            ]
 
-        sources = []
-        confirmed_mentions = 0
+            for query in queries:
+                try:
+                    result = tavily.search(
+                        query=query,
+                        max_results=10,
+                        search_depth="advanced"
+                    )
+                except Exception as search_error:
+                    print(
+                        f"PHONE SEARCH ERROR: {search_error}",
+                        flush=True
+                    )
+                    continue
 
-        complaint_words = (
-            "мошенник",
-            "мошенники",
-            "мошенничество",
-            "спам",
-            "обман",
-            "развод",
-            "вымогательство",
-            "fraud",
-            "scam"
-        )
+                for item in result.get("results", []):
+                    title = item.get("title", "")
+                    content = item.get("content", "")
+                    url = item.get("url", "")
 
-        for item in result.get("results", []):
-            title = item.get("title", "")
-            content = item.get("content", "")
-            url = item.get("url", "")
+                    combined_text = f"{title} {content}"
+                    normalized_text = re.sub(
+                        r"\D", "", combined_text
+                    )
 
-            text = f"{title} {content}".lower()
-            normalized_text = re.sub(r"\D", "", text)
+                    # Сохраняем только результаты, где найден номер.
+                    if not any(
+                        candidate in normalized_text
+                        for candidate in phone_variants
+                    ):
+                        continue
 
-            if digits not in normalized_text:
-                continue
+                    text_lower = combined_text.lower()
 
-            has_complaint = any(
-                word in text for word in complaint_words
-            )
+                    has_complaint = any(
+                        word in text_lower
+                        for word in complaint_words
+                    )
 
-            sources.append({
-                "title": title,
-                "url": url,
-                "has_complaint": has_complaint
-            })
+                    source_key = url or f"{title}:{content[:100]}"
 
-            if has_complaint:
-                confirmed_mentions += 1
+                    existing = sources_by_url.get(source_key)
 
-        if confirmed_mentions >= 3:
+                    if existing:
+                        existing["has_complaint"] = (
+                            existing["has_complaint"] or has_complaint
+                        )
+                    else:
+                        sources_by_url[source_key] = {
+                            "title": title,
+                            "url": url,
+                            "has_complaint": has_complaint
+                        }
+
+        sources = list(sources_by_url.values())
+
+        # Считаем уникальные найденные страницы, а не количество запросов.
+        complaint_sources = [
+            source for source in sources
+            if source["has_complaint"]
+        ]
+
+        complaint_count = len(complaint_sources)
+
+        if complaint_count >= 3:
             risk_level = "HIGH"
             explanation = (
-                "Найдено несколько упоминаний номера "
-                "рядом с признаками мошенничества. "
-                "Рекомендуется соблюдать осторожность."
+                "На нескольких найденных страницах есть признаки "
+                "жалоб на номер. Это сигнал риска, но не окончательное "
+                "доказательство мошенничества."
             )
-        elif confirmed_mentions >= 1:
+        elif complaint_count >= 1:
             risk_level = "MEDIUM"
             explanation = (
-                "Найдены подозрительные упоминания номера. "
-                "Мошенничество пока не подтверждено."
+                "Найдена страница с возможными признаками жалоб "
+                "на номер. Требуется дополнительная проверка."
             )
         else:
             risk_level = "UNKNOWN"
             explanation = (
-                "Данных недостаточно для оценки номера. "
+                "Не удалось найти достаточно подтверждающих данных. "
                 "Это не означает, что номер безопасен."
             )
 
@@ -326,9 +378,9 @@ def check_phone(request: PhoneCheckRequest):
             "status": "success",
             "phone_number": phone,
             "risk_level": risk_level,
-            "is_suspicious": confirmed_mentions > 0,
+            "is_suspicious": complaint_count > 0,
             "explanation": explanation,
-            "complaint_count": confirmed_mentions,
+            "complaint_count": complaint_count,
             "sources": sources
         }
 
