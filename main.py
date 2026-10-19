@@ -293,11 +293,13 @@ def check_phone(request: PhoneCheckRequest):
     try:
         for variant in variants:
             queries = [
-                f'"{variant}" "звонят мошенники"',
-                f'"{variant}" "жалоба на номер"',
-                f'"{variant}" "scam call" OR "fraud call"'
+                f'"{variant}"',
+                f'"{variant}" отзывы',
+                f'"{variant}" кто звонил',
+                f'"{variant}" спам OR мошенники OR мошенничество',
+                f'"{variant}" site:who-calls.me',
+                f'"{variant}" site:кто-звонит.рф'
             ]
-
             for query in queries:
                 try:
                     result = tavily.search(
