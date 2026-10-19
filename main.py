@@ -241,6 +241,7 @@ def analyze(request: AnalyzeRequest):
 
 
 
+
 class PhoneCheckRequest(BaseModel):
     phone_number: str
 
@@ -248,10 +249,9 @@ class PhoneCheckRequest(BaseModel):
 @app.post("/check-phone")
 def check_phone(request: PhoneCheckRequest):
     import re
-    from urllib.parse import quote_plus
 
-    original_phone = request.phone_number.strip()
-    digits = re.sub(r"\D", "", original_phone)
+    original = request.phone_number.strip()
+    digits = re.sub(r"\D", "", original)
 
     if not 7 <= len(digits) <= 15:
         raise HTTPException(
@@ -259,187 +259,169 @@ def check_phone(request: PhoneCheckRequest):
             detail="Некорректный номер телефона"
         )
 
-    # Приводим казахстанские номера к единому формату:
-    # +7 777 621 18 33 и 8 777 621 18 33 -> 7776211833
-    def normalize_phone(value):
+    def normalize(value):
         value = re.sub(r"\D", "", str(value))
-
         if len(value) == 11 and value[0] in ("7", "8"):
             value = value[1:]
-
         return value
 
-    target = normalize_phone(digits)
-
-    # Создаём варианты номера для поисковых запросов.
+    target = normalize(digits)
     variants = {digits, target}
 
     if len(target) == 10:
+        local = target
+        formatted = (
+            f"{local[:3]} {local[3:6]} "
+            f"{local[6:8]} {local[8:]}"
+        )
         variants.update({
-            "7" + target,
-            "8" + target,
-            "+7" + target,
-            "+7 " + target[:3] + " " + target[3:6]
-            + " " + target[6:8] + " " + target[8:],
-            "8 " + target[:3] + " " + target[3:6]
-            + " " + target[6:8] + " " + target[8:],
-            target[:3] + " " + target[3:6]
-            + " " + target[6:8] + " " + target[8:],
+            "7" + local,
+            "8" + local,
+            "+7" + local,
+            "+7 " + formatted,
+            "8 " + formatted,
+            formatted,
+            f"{local[:3]}-{local[3:6]}-{local[6:8]}-{local[8:]}",
         })
 
-    # Убираем повторы и пустые значения.
-    variants = list(dict.fromkeys(v for v in variants if v))
-
     queries = []
-    for number in variants[:6]:
-        queries.extend([
-            f'"{number}" мошенники',
-            f'"{number}" отзывы спам',
-        ])
+    for number in list(variants)[:4]:
+        queries.append(f'"{number}"')
+        queries.append(f'"{number}" мошенники отзывы')
 
-    all_results = []
-    search_errors = []
-    queries_sent = 0
+    results_by_url = {}
+    errors = []
 
-    # Ищем номер в разных написаниях.
     for query in queries[:8]:
-        queries_sent += 1
-
         try:
             response = tavily.search(
                 query=query,
                 max_results=5,
                 search_depth="advanced"
             )
+            for item in response.get("results", []):
+                url = str(item.get("url", ""))
+                if not url:
+                    continue
 
-            results = response.get("results", [])
-            for item in results:
-                all_results.append({
-                    "title": str(item.get("title", "")),
-                    "url": str(item.get("url", "")),
-                    "content": str(item.get("content", "")),
-                    "query": query,
-                })
-
+                if url not in results_by_url:
+                    results_by_url[url] = {
+                        "title": str(item.get("title", "")),
+                        "url": url,
+                        "content": str(item.get("content", "")),
+                    }
         except Exception as exc:
-            search_errors.append(str(exc)[:300])
+            errors.append(str(exc)[:200])
 
-    # Сравниваем номер с отдельными телефонными последовательностями,
-    # а не с произвольной склейкой всех цифр страницы.
-    def contains_exact_phone(text):
-        candidates = re.findall(
+    complaint_pattern = re.compile(
+        r"мошенн|мошенник|спам|жалоб|"
+        r"не берите трубк|обман|развод|"
+        r"scam|scammer|fraud|spam",
+        re.IGNORECASE
+    )
+
+    matched = []
+
+    for item in results_by_url.values():
+        text = (
+            item["title"] + " " +
+            item["content"] + " " +
+            item["url"]
+        )
+
+        # Ищем совпадение с отдельным номером,
+        # а не с произвольной последовательностью цифр страницы.
+        number_candidates = re.findall(
             r"(?<!\d)\+?\d(?:[\d\s().-]{5,}\d)?(?!\d)",
             text
         )
 
-        for candidate in candidates:
-            candidate_digits = re.sub(r"\D", "", candidate)
-
-            if normalize_phone(candidate_digits) == target:
-                return True
-
-        # Отдельно проверяем непрерывное написание номера.
-        for candidate in re.findall(r"(?<!\d)\d{10,15}(?!\d)", text):
-            if normalize_phone(candidate) == target:
-                return True
-
-        return False
-
-    complaint_pattern = re.compile(
-        r"мошенн|мошенник|спам|жалоб|"
-        r"не берите трубк|нежелательн.{0,30}звон|"
-        r"обман|развод|scam|scammer|fraud|spam|"
-        r"reported.{0,30}number",
-        re.IGNORECASE
-    )
-
-    matched_sources = []
-    seen_urls = set()
-
-    for item in all_results:
-        combined = (
-            item["title"] + " "
-            + item["content"] + " "
-            + item["url"]
+        exact_match = any(
+            normalize(candidate) == target
+            for candidate in number_candidates
         )
 
-        if not contains_exact_phone(combined):
+        if not exact_match:
             continue
 
-        url = item["url"]
+        # Страницы справочников и общие статьи
+        # не считаются жалобами сами по себе.
+        has_complaint = bool(complaint_pattern.search(text))
 
-        if url in seen_urls:
-            continue
-
-        seen_urls.add(url)
-
-        # Исключаем страницы, которые сами по себе не являются
-        # отзывами о конкретном номере.
-        if "docs.ps.kz" in url.lower():
-            continue
-
-        has_complaint = bool(complaint_pattern.search(combined))
-
-        matched_sources.append({
+        matched.append({
             "title": item["title"],
-            "url": url,
+            "url": item["url"],
             "content": item["content"][:1000],
             "has_complaint": has_complaint,
         })
 
     complaint_sources = [
-        source for source in matched_sources
-        if source["has_complaint"]
+        item for item in matched
+        if item["has_complaint"]
     ]
 
     complaint_count = len(complaint_sources)
 
-    # Не объявляем номер опасным только из-за общих поисковых страниц.
-    if complaint_count >= 3:
+    # Несколько результатов одного сайта не считаем
+    # независимыми подтверждениями.
+    independent_domains = set()
+
+    for item in complaint_sources:
+        domain_match = re.search(
+            r"https?://([^/]+)",
+            item["url"],
+            re.IGNORECASE
+        )
+        if domain_match:
+            domain = domain_match.group(1).lower()
+            if not domain.endswith("ps.kz"):
+                independent_domains.add(domain)
+
+    if len(independent_domains) >= 3:
         risk_level = "HIGH"
         is_suspicious = True
         explanation = (
-            "Найдены несколько результатов с точным совпадением номера "
-            "и признаками жалоб. Рекомендуется проверить источники."
+            "Найдены жалобы на этот номер на нескольких доменах. "
+            "Результаты требуют проверки перед автоматической блокировкой."
         )
     elif complaint_count >= 1:
         risk_level = "MEDIUM"
         is_suspicious = False
         explanation = (
-            "Найдена как минимум одна страница с точным совпадением "
-            "номера и признаками жалоб. Данных недостаточно "
-            "для уверенного подтверждения мошенничества."
+            "Найдены страницы с совпадающим номером и признаками жалоб. "
+            "Данных недостаточно для уверенного подтверждения."
         )
-    elif matched_sources:
+    elif matched:
         risk_level = "UNKNOWN"
         is_suspicious = False
         explanation = (
-            "Номер найден в поиске, но убедительных признаков "
-            "мошенничества не обнаружено."
+            "Номер встречается в поиске, но достоверных жалоб "
+            "не установлено."
         )
     else:
         risk_level = "UNKNOWN"
         is_suspicious = False
         explanation = (
-            "Не найдено страниц с точным совпадением номера. "
-            "Это не означает, что номер безопасен."
+            "Поиск не нашёл страниц с точным совпадением номера. "
+            "Это не доказывает, что номер безопасен."
         )
 
     return {
         "status": "success",
-        "phone_number": original_phone,
+        "phone_number": original,
         "normalized_number": target,
         "risk_level": risk_level,
         "is_suspicious": is_suspicious,
         "explanation": explanation,
         "complaint_count": complaint_count,
         "search_diagnostics": {
-            "queries_sent": queries_sent,
-            "raw_results_count": len(all_results),
-            "exact_match_count": len(matched_sources),
-            "matched_sources_count": len(matched_sources),
-            "search_errors": search_errors,
+            "queries_sent": min(len(queries), 8),
+            "raw_results_count": len(results_by_url),
+            "exact_match_count": len(matched),
+            "matched_sources_count": len(matched),
+            "independent_domains": len(independent_domains),
+            "search_errors": errors,
         },
-        "sources": matched_sources[:30],
+        "sources": matched[:30],
     }
 
