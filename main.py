@@ -243,7 +243,6 @@ class PhoneCheckRequest(BaseModel):
 
 
 
-
 @app.post("/check-phone")
 def check_phone(request: PhoneCheckRequest):
     import re
@@ -257,22 +256,15 @@ def check_phone(request: PhoneCheckRequest):
             detail="Некорректный номер телефона"
         )
 
-    # Несколько вариантов записи одного номера.
-    variants = {phone, digits, f"+{digits}"}
-
-    # Для номеров Казахстана и России учитываем 8 вместо 7.
-    if len(digits) == 11 and digits.startswith("7"):
-        variants.add("8" + digits[1:])
-
     try:
         result = tavily.search(
-            query=f'"{digits}"',
+            query=f'"{digits}" мошенничество OR спам OR мошенник',
             max_results=10,
-            search_depth="basic"
+            search_depth="advanced"
         )
 
         sources = []
-        complaint_count = 0
+        confirmed_mentions = 0
 
         complaint_words = (
             "мошенник",
@@ -292,23 +284,13 @@ def check_phone(request: PhoneCheckRequest):
             url = item.get("url", "")
 
             text = f"{title} {content}".lower()
-
-            # Проверяем, упоминается ли конкретный номер.
             normalized_text = re.sub(r"\D", "", text)
 
-            number_found = any(
-                variant in text
-                for variant in variants
-                if variant
-            ) or digits in normalized_text
-
-            if not number_found:
+            if digits not in normalized_text:
                 continue
 
-            # Проверяем наличие слов, связанных с жалобами.
             has_complaint = any(
-                word in text
-                for word in complaint_words
+                word in text for word in complaint_words
             )
 
             sources.append({
@@ -318,29 +300,25 @@ def check_phone(request: PhoneCheckRequest):
             })
 
             if has_complaint:
-                complaint_count += 1
+                confirmed_mentions += 1
 
-        # Предварительная оценка по количеству найденных
-        # упоминаний. Это не подтверждение мошенничества.
-        if complaint_count >= 3:
+        if confirmed_mentions >= 3:
             risk_level = "HIGH"
             explanation = (
-                "Найдено несколько публичных упоминаний "
-                "номера в материалах с признаками жалоб. "
+                "Найдено несколько упоминаний номера "
+                "рядом с признаками мошенничества. "
                 "Рекомендуется соблюдать осторожность."
             )
-        elif complaint_count >= 1:
+        elif confirmed_mentions >= 1:
             risk_level = "MEDIUM"
             explanation = (
-                "Найдено упоминание номера рядом со словами, "
-                "связанными с мошенничеством или спамом. "
-                "Достоверность жалобы не подтверждена."
+                "Найдены подозрительные упоминания номера. "
+                "Мошенничество пока не подтверждено."
             )
         else:
             risk_level = "UNKNOWN"
             explanation = (
-                "Достоверных сведений о мошенничестве "
-                "по этому номеру не найдено. "
+                "Данных недостаточно для оценки номера. "
                 "Это не означает, что номер безопасен."
             )
 
@@ -348,19 +326,21 @@ def check_phone(request: PhoneCheckRequest):
             "status": "success",
             "phone_number": phone,
             "risk_level": risk_level,
-            "is_suspicious": complaint_count > 0,
+            "is_suspicious": confirmed_mentions > 0,
             "explanation": explanation,
-            "complaint_count": complaint_count,
+            "complaint_count": confirmed_mentions,
             "sources": sources
         }
 
-    except Exception:
+    except Exception as e:
+        print(f"PHONE CHECK ERROR: {e}", flush=True)
+
         return {
             "status": "error",
             "phone_number": phone,
             "risk_level": "UNKNOWN",
             "is_suspicious": False,
-            "explanation": "Не удалось выполнить поиск сведений о номере",
+            "explanation": "Не удалось проверить номер",
             "complaint_count": 0,
             "sources": []
         }
