@@ -245,10 +245,10 @@ def analyze(request: AnalyzeRequest):
 class PhoneCheckRequest(BaseModel):
     phone_number: str
 
-
 @app.post("/check-phone")
 def check_phone(request: PhoneCheckRequest):
     import re
+    from urllib.parse import urlparse
 
     original = request.phone_number.strip()
     digits = re.sub(r"\D", "", original)
@@ -261,62 +261,114 @@ def check_phone(request: PhoneCheckRequest):
 
     def normalize(value):
         value = re.sub(r"\D", "", str(value))
-        if len(value) == 11 and value[0] in ("7", "8"):
+
+        # Нормализация номеров Казахстана и России:
+        # 8XXXXXXXXXX -> 7XXXXXXXXXX -> XXXXXXXXXX
+        if len(value) == 11 and value[0] == "8":
+            value = "7" + value[1:]
+
+        if len(value) == 11 and value[0] == "7":
             value = value[1:]
+
         return value
 
     target = normalize(digits)
-    variants = {digits, target}
+
+    # Формируем варианты написания номера для поиска.
+    search_variants = []
+    queries = []
+
+    def add_search_variant(value):
+        if value and value not in search_variants:
+            search_variants.append(value)
+
+    add_search_variant(target)
+    add_search_variant(digits)
 
     if len(target) == 10:
-        local = target
         formatted = (
-            f"{local[:3]} {local[3:6]} "
-            f"{local[6:8]} {local[8:]}"
+            f"{target[:3]} {target[3:6]} "
+            f"{target[6:8]} {target[8:]}"
         )
-        variants.update({
-            "7" + local,
-            "8" + local,
-            "+7" + local,
-            "+7 " + formatted,
-            "8 " + formatted,
-            formatted,
-            f"{local[:3]}-{local[3:6]}-{local[6:8]}-{local[8:]}",
-        })
 
-    queries = []
-    for number in list(variants)[:4]:
+        add_search_variant("+7" + target)
+        add_search_variant("8" + target)
+        add_search_variant("+7 " + formatted)
+        add_search_variant("8 " + formatted)
+        add_search_variant(formatted)
+
+    for number in search_variants:
         queries.append(f'"{number}"')
-        queries.append(f'"{number}" мошенники отзывы')
+        queries.append(f'"{number}" отзывы жалобы мошенники')
 
+    # Ограничиваем количество запросов к поиску.
+    queries = queries[:8]
+
+    # Собираем результаты, исключая дубликаты URL.
     results_by_url = {}
     errors = []
 
-    for query in queries[:8]:
+    for query in queries:
         try:
             response = tavily.search(
                 query=query,
                 max_results=5,
                 search_depth="advanced"
             )
-            for item in response.get("results", []):
-                url = str(item.get("url", ""))
+
+            for result in response.get("results", []):
+                url = str(result.get("url", "")).strip()
+
                 if not url:
                     continue
 
                 if url not in results_by_url:
                     results_by_url[url] = {
-                        "title": str(item.get("title", "")),
+                        "title": str(result.get("title", "")),
                         "url": url,
-                        "content": str(item.get("content", "")),
+                        "content": str(result.get("content", "")),
                     }
+
         except Exception as exc:
             errors.append(str(exc)[:200])
 
+    # Ищем формулировки, похожие на конкретную жалобу.
+    # Одного слова "мошенники" недостаточно.
     complaint_pattern = re.compile(
-        r"мошенн|мошенник|спам|жалоб|"
-        r"не берите трубк|обман|развод|"
-        r"scam|scammer|fraud|spam",
+        r"меня обманул|меня обманули|обманули меня|"
+        r"украли деньги|списали деньги без моего согласия|"
+        r"мошенники звонили|звонили мошенники|"
+        r"представились сотрудниками банка|"
+        r"представился сотрудником банка|"
+        r"представились сотрудниками полиции|"
+        r"вымогали деньги|пытались обмануть|"
+        r"не возвращают деньги|жалуюсь на номер|"
+        r"жалоба на номер|отзыв о номере|"
+        r"не берите трубку|звонили и требовали|"
+        r"алаяқ|алаяқтар|алдап кетті|"
+        r"ақшамды алды|ақшамды ұрлады|"
+        r"scam caller|phone scam|fraudulent call|"
+        r"reported as spam",
+        re.IGNORECASE
+    )
+
+    # Признаки официальной справочной страницы.
+    # Само упоминание полиции не отменяет наличие жалобы.
+    official_contact_pattern = re.compile(
+        r"киберпол|cyberpol|"
+        r"официальный телефон|официальный номер|"
+        r"горячая линия|телефон доверия|"
+        r"справочная служба|"
+        r"консультаци[яи]\s+по вопросам",
+        re.IGNORECASE
+    )
+
+    strong_complaint_pattern = re.compile(
+        r"меня обманул|меня обманули|"
+        r"украли деньги|вымогали деньги|"
+        r"пытались обмануть|"
+        r"алаяқтар|алдап кетті|"
+        r"phone scam|fraudulent call",
         re.IGNORECASE
     )
 
@@ -329,10 +381,10 @@ def check_phone(request: PhoneCheckRequest):
             item["url"]
         )
 
-        # Ищем совпадение с отдельным номером,
-        # а не с произвольной последовательностью цифр страницы.
+        # Извлекаем телефонные последовательности
+        # и сравниваем их после нормализации.
         number_candidates = re.findall(
-            r"(?<!\d)\+?\d(?:[\d\s().-]{5,}\d)?(?!\d)",
+            r"(?<!\d)\+?\d(?:[\d\s().-]{5,}\d)(?!\d)",
             text
         )
 
@@ -344,67 +396,104 @@ def check_phone(request: PhoneCheckRequest):
         if not exact_match:
             continue
 
-        # Страницы справочников и общие статьи
-        # не считаются жалобами сами по себе.
-        has_complaint = bool(complaint_pattern.search(text))
+        has_complaint_phrase = bool(
+            complaint_pattern.search(text)
+        )
+
+        official_context = bool(
+            official_contact_pattern.search(text)
+        )
+
+        strong_complaint = bool(
+            strong_complaint_pattern.search(text)
+        )
+
+        # Не считаем обычную официальную контактную страницу
+        # жалобой, если нет конкретных признаков негативного опыта.
+        has_complaint = (
+            has_complaint_phrase
+            and (
+                not official_context
+                or strong_complaint
+            )
+        )
+
+        domain = (
+            urlparse(item["url"]).hostname or ""
+        ).lower()
+
+        if domain.startswith("www."):
+            domain = domain[4:]
 
         matched.append({
             "title": item["title"],
             "url": item["url"],
             "content": item["content"][:1000],
             "has_complaint": has_complaint,
+            "domain": domain,
         })
 
+    # Оставляем только источники с признаками жалоб.
     complaint_sources = [
         item for item in matched
         if item["has_complaint"]
     ]
 
+    # Считаем разные домены, а не количество страниц.
+    # ps.kz исключён из подсчёта.
+    independent_domains = {
+        item["domain"]
+        for item in complaint_sources
+        if item["domain"]
+        and item["domain"] != "ps.kz"
+        and not item["domain"].endswith(".ps.kz")
+    }
+
     complaint_count = len(complaint_sources)
-
-    # Несколько результатов одного сайта не считаем
-    # независимыми подтверждениями.
-    independent_domains = set()
-
-    for item in complaint_sources:
-        domain_match = re.search(
-            r"https?://([^/]+)",
-            item["url"],
-            re.IGNORECASE
-        )
-        if domain_match:
-            domain = domain_match.group(1).lower()
-            if not domain.endswith("ps.kz"):
-                independent_domains.add(domain)
 
     if len(independent_domains) >= 3:
         risk_level = "HIGH"
         is_suspicious = True
         explanation = (
-            "Найдены жалобы на этот номер на нескольких доменах. "
-            "Результаты требуют проверки перед автоматической блокировкой."
+            "Найдены совпадающий номер и признаки жалоб "
+            "на трёх или более разных доменах. Это поисковые "
+            "сигналы, а не окончательное доказательство мошенничества."
         )
+
     elif complaint_count >= 1:
         risk_level = "MEDIUM"
         is_suspicious = False
         explanation = (
-            "Найдены страницы с совпадающим номером и признаками жалоб. "
-            "Данных недостаточно для уверенного подтверждения."
+            "Найдена страница с совпадающим номером и возможными "
+            "признаками жалобы. Требуется дополнительная проверка."
         )
+
     elif matched:
         risk_level = "UNKNOWN"
         is_suspicious = False
         explanation = (
-            "Номер встречается в поиске, но достоверных жалоб "
-            "не установлено."
+            "Номер найден в поиске, но убедительных признаков "
+            "жалоб в найденных фрагментах нет."
         )
+
     else:
         risk_level = "UNKNOWN"
         is_suspicious = False
         explanation = (
-            "Поиск не нашёл страниц с точным совпадением номера. "
-            "Это не доказывает, что номер безопасен."
+            "Поиск не обнаружил страниц с точным совпадением номера. "
+            "Это не гарантирует, что номер безопасен."
         )
+
+    # Убираем внутреннее поле domain из публичного ответа.
+    public_sources = [
+        {
+            "title": item["title"],
+            "url": item["url"],
+            "content": item["content"],
+            "has_complaint": item["has_complaint"],
+        }
+        for item in matched
+    ]
 
     return {
         "status": "success",
@@ -415,13 +504,12 @@ def check_phone(request: PhoneCheckRequest):
         "explanation": explanation,
         "complaint_count": complaint_count,
         "search_diagnostics": {
-            "queries_sent": min(len(queries), 8),
+            "queries_sent": len(queries),
             "raw_results_count": len(results_by_url),
             "exact_match_count": len(matched),
             "matched_sources_count": len(matched),
             "independent_domains": len(independent_domains),
             "search_errors": errors,
         },
-        "sources": matched[:30],
+        "sources": public_sources[:30],
     }
-
