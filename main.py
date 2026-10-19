@@ -238,12 +238,15 @@ def analyze(request: AnalyzeRequest):
         "sources": sources
     }
 
+
 class PhoneCheckRequest(BaseModel):
     phone_number: str
+
 
 @app.post("/check-phone")
 def check_phone(request: PhoneCheckRequest):
     import re
+    from urllib.parse import urlparse
 
     phone = request.phone_number.strip()
     digits = re.sub(r"\D", "", phone)
@@ -262,143 +265,136 @@ def check_phone(request: PhoneCheckRequest):
     if len(digits) == 11 and digits.startswith("7"):
         variants.add("8" + digits[1:])
 
-    # Слова должны указывать именно на жалобу на звонок.
+    queries = []
+    for variant in variants:
+        queries.extend([
+            f'"{variant}"',
+            f'"{variant}" отзывы',
+            f'"{variant}" кто звонил',
+            f'"{variant}" спам мошенники',
+            f'"{variant}" жалобы на звонки',
+            f'"{variant}" scam phone number',
+        ])
+
     complaint_phrases = (
         "мошеннический звонок",
         "звонят мошенники",
         "номер мошенников",
         "номер мошенника",
-        "этот номер мошенник",
         "телефонные мошенники",
         "подозрительный звонок",
         "жалоба на номер",
         "жалобы на номер",
+        "сообщить о спаме",
         "спам звонки",
         "нежелательные звонки",
+        "мошенничество по телефону",
         "scam call",
         "fraud call",
         "reported as spam",
         "phone scam",
-        "scammer number"
-    )
-
-    # Технические страницы не считаем доказательством жалобы.
-    excluded_domains = (
-        "docs.ps.kz",
-        "autocall.kz"
+        "scammer number",
+        "spam calls",
+        "fraudulent call",
     )
 
     sources_by_url = {}
+    search_errors = []
 
-    try:
-        for variant in variants:
-            queries = [
-                f'"{variant}"',
-                f'"{variant}" отзывы',
-                f'"{variant}" кто звонил',
-                f'"{variant}" спам OR мошенники OR мошенничество',
-                f'"{variant}" site:who-calls.me',
-                f'"{variant}" site:кто-звонит.рф'
-            ]
-            for query in queries:
-                try:
-                    result = tavily.search(
-                        query=query,
-                        max_results=10,
-                        search_depth="advanced"
-                    )
-                except Exception as search_error:
-                    print(
-                        f"PHONE SEARCH ERROR: {search_error}",
-                        flush=True
-                    )
-                    continue
+    for query in queries:
+        try:
+            result = tavily.search(
+                query=query,
+                max_results=10,
+                search_depth="advanced"
+            )
+        except Exception as error:
+            print(f"PHONE SEARCH ERROR: {error}", flush=True)
+            search_errors.append(str(error))
+            continue
 
-                for item in result.get("results", []):
-                    title = item.get("title", "")
-                    content = item.get("content", "")
-                    url = item.get("url", "")
+        for item in result.get("results", []):
+            title = item.get("title") or ""
+            content = item.get("content") or ""
+            url = item.get("url") or ""
 
-                    # Проверяем, что номер присутствует в тексте.
-                    normalized = re.sub(
-                        r"\D", "", f"{title} {content}"
-                    )
+            combined = f"{title} {content} {url}"
+            normalized = re.sub(r"\D", "", combined)
 
-                    if not any(v in normalized for v in variants):
-                        continue
+            # Не учитываем страницы, где номер не найден.
+            if not any(v in normalized for v in variants):
+                continue
 
-                    domain = url.lower().split("/")[2] if "://" in url else ""
+            domain = urlparse(url).netloc.lower().split(":")[0]
 
-                    if any(
-                        domain == excluded or domain.endswith("." + excluded)
-                        for excluded in excluded_domains
-                    ):
-                        continue
+            if (
+                domain == "docs.ps.kz"
+                or domain.endswith(".docs.ps.kz")
+                or domain == "autocall.kz"
+                or domain.endswith(".autocall.kz")
+            ):
+                continue
 
-                    text_lower = f"{title} {content}".lower()
+            text_lower = f"{title} {content}".lower()
 
-                    has_complaint = any(
-                        phrase in text_lower
-                        for phrase in complaint_phrases
-                    )
+            has_complaint = any(
+                phrase in text_lower
+                for phrase in complaint_phrases
+            )
 
-                    key = url or f"{title}:{content[:100]}"
+            key = url or f"{title}:{content[:150]}"
 
-                    if key not in sources_by_url:
-                        sources_by_url[key] = {
-                            "title": title,
-                            "url": url,
-                            "has_complaint": has_complaint
-                        }
-                    elif has_complaint:
-                        sources_by_url[key]["has_complaint"] = True
+            if key not in sources_by_url:
+                sources_by_url[key] = {
+                    "title": title,
+                    "url": url,
+                    "content": content[:500],
+                    "has_complaint": has_complaint
+                }
+            elif has_complaint:
+                sources_by_url[key]["has_complaint"] = True
 
-        sources = list(sources_by_url.values())
+    sources = list(sources_by_url.values())
 
-        complaint_count = sum(
-            1 for source in sources if source["has_complaint"]
+    complaint_sources = [
+        source for source in sources
+        if source["has_complaint"]
+    ]
+
+    complaint_count = len(complaint_sources)
+
+    if complaint_count >= 3:
+        risk_level = "HIGH"
+        explanation = (
+            "Найдено несколько страниц с возможными жалобами. "
+            "Перед блокировкой необходимо проверить источники."
+        )
+    elif complaint_count >= 1:
+        risk_level = "MEDIUM"
+        explanation = (
+            "Найдены возможные жалобы на номер. "
+            "Это предварительная оценка, а не доказательство мошенничества."
+        )
+    elif sources:
+        risk_level = "UNKNOWN"
+        explanation = (
+            "Найдены страницы с упоминанием номера, "
+            "но явных жалоб по используемым признакам недостаточно."
+        )
+    else:
+        risk_level = "UNKNOWN"
+        explanation = (
+            "Поиск не нашёл подтверждённых совпадений. "
+            "Это не означает, что номер безопасен."
         )
 
-        # Не блокируем номер только по результатам общего поиска.
-        # Для HIGH нужны несколько отдельных страниц с явными жалобами.
-        if complaint_count >= 3:
-            risk_level = "HIGH"
-            explanation = (
-                "Найдено несколько страниц с формулировками, "
-                "похожими на жалобы на номер. Требуется проверка источников."
-            )
-        elif complaint_count >= 1:
-            risk_level = "MEDIUM"
-            explanation = (
-                "Найдены возможные жалобы на номер. "
-                "Информация не подтверждена окончательно."
-            )
-        else:
-            risk_level = "UNKNOWN"
-            explanation = (
-                "Не найдено достаточно явных жалоб на номер. "
-                "Это не означает, что номер безопасен."
-            )
-
-        return {
-            "status": "success",
-            "phone_number": phone,
-            "risk_level": risk_level,
-            "is_suspicious": complaint_count > 0,
-            "explanation": explanation,
-            "complaint_count": complaint_count,
-            "sources": sources
-        }
-
-    except Exception as e:
-        print(f"PHONE CHECK ERROR: {e}", flush=True)
-
-        return {
-            "status": "error",
-            "phone_number": phone,
-            "risk_level": "UNKNOWN",
-            "is_suspicious": False,
-            "explanation": "Не удалось проверить номер",
-            "complaint_count": 0,
-            "sources": []
-        }
+    return {
+        "status": "success",
+        "phone_number": phone,
+        "risk_level": risk_level,
+        "is_suspicious": complaint_count > 0,
+        "explanation": explanation,
+        "complaint_count": complaint_count,
+        "sources": sources,
+        "search_errors": len(search_errors)
+    }
