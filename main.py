@@ -526,8 +526,12 @@ class ChatRequest(BaseModel):
 
 
 
+
 @app.post("/chat")
 def chat(request: ChatRequest):
+    import urllib.request
+    import urllib.error
+
     message = request.message.strip()
 
     if not message:
@@ -536,7 +540,16 @@ def chat(request: ChatRequest):
             detail="Напиши сообщение для ИИ"
         )
 
-    contents = []
+    system_instruction = (
+        "Ты — дружелюбный ИИ-помощник приложения TRUSTGUARD. "
+        "Общайся на русском языке, отвечай понятно и по существу. "
+        "Помогай с обычными вопросами и программированием. "
+        "При подозрительных просьбах перевести деньги помогай "
+        "безопасно проверить ситуацию."
+    )
+
+    # Подготавливаем историю для обоих ИИ.
+    history = []
 
     for item in request.history[-20:]:
         if item.role not in {"user", "assistant"}:
@@ -545,54 +558,125 @@ def chat(request: ChatRequest):
         content = item.content.strip()
 
         if content:
-            role = "model" if item.role == "assistant" else "user"
-
-            contents.append({
-                "role": role,
-                "parts": [{"text": content[:5000]}]
+            history.append({
+                "role": item.role,
+                "content": content[:5000]
             })
 
-    contents.append({
+    history.append({
         "role": "user",
-        "parts": [{"text": message[:10000]}]
+        "content": message[:10000]
     })
 
+    # 1. Сначала пробуем Gemini.
     try:
+        print(">>> CHAT: пробуем Gemini", flush=True)
+
+        contents = []
+
+        for item in history:
+            contents.append({
+                "role": (
+                    "model"
+                    if item["role"] == "assistant"
+                    else "user"
+                ),
+                "parts": [{"text": item["content"]}]
+            })
+
         response = gemini.models.generate_content(
             model="gemini-3.8-flash",
             contents=contents,
             config={
-                "system_instruction": (
-                    "Ты — дружелюбный ИИ-помощник приложения TRUSTGUARD. "
-                    "Общайся на русском языке, отвечай понятно и по существу. "
-                    "Помогай с обычными вопросами и программированием. "
-                    "При подозрительных просьбах перевести деньги помогай "
-                    "безопасно проверить ситуацию."
-                ),
+                "system_instruction": system_instruction,
                 "temperature": 0.7,
             },
         )
 
         answer = (response.text or "").strip()
 
-        if not answer:
-            raise HTTPException(
-                status_code=502,
-                detail="ИИ не вернул ответ"
+        if answer:
+            print(">>> CHAT: ответ получен от Gemini", flush=True)
+            return {
+                "status": "success",
+                "reply": answer
+            }
+
+        print(">>> CHAT: Gemini вернул пустой ответ", flush=True)
+
+    except Exception as e:
+        print(f">>> GEMINI CHAT ERROR: {repr(e)}", flush=True)
+
+    # 2. Если Gemini не ответил, пробуем Groq.
+    groq_api_key = os.getenv("GROQ_API_KEY")
+
+    if not groq_api_key:
+        print(">>> GROQ ERROR: GROQ_API_KEY не задан", flush=True)
+        raise HTTPException(
+            status_code=502,
+            detail="Основной ИИ недоступен, резервный ИИ не настроен."
+        )
+
+    try:
+        print(">>> CHAT: переключаемся на Groq", flush=True)
+
+        groq_messages = [
+            {
+                "role": "system",
+                "content": system_instruction
+            }
+        ]
+
+        groq_messages.extend(history)
+
+        payload = {
+            "model": "openai/gpt-oss-20b",
+            "messages": groq_messages,
+            "temperature": 0.7,
+            "max_completion_tokens": 2048
+        }
+
+        data = json.dumps(payload).encode("utf-8")
+
+        groq_request = urllib.request.Request(
+            url="https://api.groq.com/openai/v1/chat/completions",
+            data=data,
+            headers={
+                "Authorization": f"Bearer {groq_api_key}",
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+
+        with urllib.request.urlopen(
+            groq_request,
+            timeout=45
+        ) as groq_response:
+            result = json.loads(
+                groq_response.read().decode("utf-8")
             )
+
+        answer = (
+            result.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+
+        if not answer:
+            raise ValueError("Groq вернул пустой ответ")
+
+        print(">>> CHAT: ответ получен от Groq", flush=True)
 
         return {
             "status": "success",
             "reply": answer
         }
 
-    except HTTPException:
-        raise
-
     except Exception as e:
-        print(f">>> CHAT ERROR: {repr(e)}", flush=True)
+        print(f">>> GROQ CHAT ERROR: {repr(e)}", flush=True)
 
         raise HTTPException(
             status_code=502,
-            detail="Не удалось получить ответ от ИИ. Проверь настройки сервера."
+            detail="Основной и резервный ИИ временно недоступны."
         )
