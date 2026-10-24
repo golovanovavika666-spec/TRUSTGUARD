@@ -643,7 +643,8 @@ def chat(request: ChatRequest):
             data=data,
             headers={
                 "Authorization": f"Bearer {groq_api_key}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "User-Agent": "TRUSTGUARD/1.0"
             },
             method="POST"
         )
