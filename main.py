@@ -2,7 +2,7 @@ import os
 import json
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from google import genai
 from tavily import TavilyClient
@@ -513,3 +513,86 @@ def check_phone(request: PhoneCheckRequest):
         },
         "sources": public_sources[:30],
     }
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[ChatMessage] = Field(default_factory=list)
+
+
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+    message = request.message.strip()
+
+    if not message:
+        raise HTTPException(
+            status_code=400,
+            detail="Напиши сообщение для ИИ"
+        )
+
+    contents = []
+
+    for item in request.history[-20:]:
+        if item.role not in {"user", "assistant"}:
+            continue
+
+        content = item.content.strip()
+
+        if content:
+            role = "model" if item.role == "assistant" else "user"
+
+            contents.append({
+                "role": role,
+                "parts": [{"text": content[:5000]}]
+            })
+
+    contents.append({
+        "role": "user",
+        "parts": [{"text": message[:10000]}]
+    })
+
+    try:
+        response = gemini.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config={
+                "system_instruction": (
+                    "Ты — дружелюбный ИИ-помощник приложения TRUSTGUARD. "
+                    "Общайся на русском языке, отвечай понятно и по существу. "
+                    "Помогай с обычными вопросами и программированием. "
+                    "При подозрительных просьбах перевести деньги помогай "
+                    "безопасно проверить ситуацию."
+                ),
+                "temperature": 0.7,
+            },
+        )
+
+        answer = (response.text or "").strip()
+
+        if not answer:
+            raise HTTPException(
+                status_code=502,
+                detail="ИИ не вернул ответ"
+            )
+
+        return {
+            "status": "success",
+            "reply": answer
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print(f">>> CHAT ERROR: {repr(e)}", flush=True)
+
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось получить ответ от ИИ. Проверь настройки сервера."
+        )
