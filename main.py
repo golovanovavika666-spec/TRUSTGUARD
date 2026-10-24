@@ -674,7 +674,25 @@ def chat(request: ChatRequest):
         }
 
     except Exception as e:
-        print(f">>> GROQ CHAT ERROR: {repr(e)}", flush=True)
+        if isinstance(e, urllib.error.HTTPError):
+            error_body = e.read().decode(
+                "utf-8",
+                errors="replace"
+            )
+
+            print(
+                f">>> GROQ HTTP STATUS: {e.code}",
+                flush=True
+            )
+            print(
+                f">>> GROQ HTTP BODY: {error_body}",
+                flush=True
+            )
+        else:
+            print(
+                f">>> GROQ CHAT ERROR: {repr(e)}",
+                flush=True
+            )
 
         raise HTTPException(
             status_code=502,
